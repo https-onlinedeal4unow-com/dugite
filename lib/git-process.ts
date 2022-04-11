@@ -1,7 +1,8 @@
+
 import * as fs from 'fs'
 
-import { execFile, spawn, ExecOptionsWithStringEncoding } from 'child_process'
-import { RepositoryDoesNotExistErrorCode, GitNotFoundErrorCode } from './errors'
+import { execFile, spawn, ExecFileOptionsWithStringEncoding } from 'child_process'
+import { GitError, GitErrorRegexes, RepositoryDoesNotExistErrorCode, GitNotFoundErrorCode } from './errors'
 import { ChildProcess } from 'child_process'
 
 import { setupEnvironment } from './git-environment'
@@ -28,7 +29,7 @@ export interface IGitSpawnExecutionOptions {
    * set as environment variables before executing the git
    * process.
    */
-  readonly env?: Object
+  readonly env?: Object,
 }
 
 /**
@@ -41,7 +42,7 @@ export interface IGitExecutionOptions {
    * set as environment variables before executing the git
    * process.
    */
-  readonly env?: Object
+  readonly env?: Object,
 
   /**
    * An optional string or buffer which will be written to
@@ -72,7 +73,7 @@ export interface IGitExecutionOptions {
    * Note that if the stdin parameter was specified the stdin
    * stream will be closed by the time this callback fires.
    */
-  readonly processCallback?: (process: ChildProcess) => void
+   readonly processCallback?: (process: ChildProcess) => void
 }
 
 /**
@@ -80,18 +81,105 @@ export interface IGitExecutionOptions {
  * without resorting to `any` casts.
  */
 interface ErrorWithCode extends Error {
-  code: string | number | undefined
+  code: string | number
 }
 
-export class GitProcess {
-  private static pathExists(path: string): Boolean {
-    try {
-      fs.accessSync(path, (fs as any).F_OK)
-      return true
-    } catch {
-      return false
-    }
+interface IRunningGitProcess {
+  child_process: ChildProcess,
+  promise: Promise<IGitResult>
+}
+
+function formatPktLine(content: string) {
+  if (content.length > 65520) {
+    throw new Error('protocol error: impossibly long line')
   }
+
+  const hexLength = (content.length + 4).toString(16)
+  const pktLineLen = (`0000${hexLength}`).substring(hexLength.length)
+
+  return pktLineLen + content
+}
+
+async function startProcess(file: string, args: string[], options: ExecFileOptionsWithStringEncoding): Promise<IRunningGitProcess> {
+
+  let child_process: ChildProcess | undefined
+
+  const promise = new Promise<IGitResult>((resolve, reject) => {
+    child_process = execFile(file, args, options, function(err: ErrorWithCode, stdout, stderr) {
+      const code = err ? err.code : 0
+      // If the error's code is a string then it means the code isn't the
+      // process's exit code but rather an error coming from Node's bowels,
+      // e.g., ENOENT.
+      if (typeof code === 'string') {
+        if (code === 'ENOENT') {
+          let message = err.message
+          let code = err.code
+          if (options && options.cwd && pathExists(options.cwd) === false) {
+            message = 'Unable to find path to repository on disk.'
+            code = RepositoryDoesNotExistErrorCode
+          } else {
+            message = `Git could not be found at the expected path: '${file}'. This might be a problem with how the application is packaged, so confirm this folder hasn't been removed when packaging.`
+            code = GitNotFoundErrorCode
+          }
+
+          const error = new Error(message) as ErrorWithCode
+          error.name = err.name
+          error.code = code
+          reject(error)
+        } else {
+          reject(err)
+        }
+
+        return
+      }
+
+      if (code === undefined && err) {
+        // Git has returned an output that couldn't fit in the specified buffer
+        // as we don't know how many bytes it requires, rethrow the error with
+        // details about what it was previously set to...
+        if (err.message === 'stdout maxBuffer exceeded') {
+          reject(new Error(`The output from the command could not fit into the allocated stdout buffer. Set options.maxBuffer to a larger value than ${options.maxBuffer} bytes`))
+        }
+      }
+
+      /**
+       * If we're running read-command we won't get the ENOENT error from git since we're
+       * always launching the process in a known location and then, at a later stage,
+       * letting Git know where to operate. We will, however, get a very specific error
+       * message and a known exit code so we'll intercept that and throw the same
+       * error as we do for ENOENT.
+       */
+      if (code === 128 && /fatal: Cannot change to '(.*?)': No such file or directory/.test(stderr)) {
+        const error = new Error('Unable to find path to repository on disk.') as ErrorWithCode
+        error.code = RepositoryDoesNotExistErrorCode
+        return reject(error)
+      }
+
+      resolve({ stdout, stderr, exitCode: code })
+    })
+  })
+
+
+  if (!child_process) {
+    throw Error('failed to start process')
+  }
+
+  return { child_process, promise }
+}
+
+function pathExists(path: string): Boolean {
+  try {
+      fs.accessSync(path, (fs as any).F_OK);
+      return true
+  } catch (e) {
+      return false
+  }
+}
+
+let HotSpare: IRunningGitProcess | null = null
+let LaunchingHotSpare = false
+
+export class GitProcess {
 
   /**
    * Execute a command and interact with the process outputs directly.
@@ -100,12 +188,8 @@ export class GitProcess {
    * in which case the thrown Error will have a string `code` property. See
    * `errors.ts` for some of the known error codes.
    */
-  public static spawn(
-    args: string[],
-    path: string,
-    options?: IGitSpawnExecutionOptions
-  ): ChildProcess {
-    let customEnv = {}
+  public static spawn(args: string[], path: string, options?: IGitSpawnExecutionOptions): ChildProcess {
+    let customEnv = { }
     if (options && options.env) {
       customEnv = options.env
     }
@@ -118,8 +202,6 @@ export class GitProcess {
     }
 
     const spawnedProcess = spawn(gitLocation, args, spawnArgs)
-
-    ignoreClosedInputStream(spawnedProcess)
 
     return spawnedProcess
   }
@@ -134,154 +216,104 @@ export class GitProcess {
    * See the result's `stderr` and `exitCode` for any potential git error
    * information.
    */
-  public static exec(
-    args: string[],
-    path: string,
-    options?: IGitExecutionOptions
-  ): Promise<IGitResult> {
-    return new Promise<IGitResult>(function(resolve, reject) {
-      let customEnv = {}
-      if (options && options.env) {
-        customEnv = options.env
-      }
+  public static async exec(args: string[], path: string, options?: IGitExecutionOptions): Promise<IGitResult> {
+    let customEnv = { }
 
-      const { env, gitLocation } = setupEnvironment(customEnv)
+    if (options && options.env) {
+      customEnv = options.env
+    }
 
-      // Explicitly annotate opts since typescript is unable to infer the correct
-      // signature for execFile when options is passed as an opaque hash. The type
-      // definition for execFile currently infers based on the encoding parameter
-      // which could change between declaration time and being passed to execFile.
-      // See https://git.io/vixyQ
-      const execOptions: ExecOptionsWithStringEncoding = {
-        cwd: path,
-        encoding: 'utf8',
-        maxBuffer: options ? options.maxBuffer : 10 * 1024 * 1024,
-        env
-      }
+    const { env, gitLocation } = setupEnvironment(customEnv)
+    const useReadCommand = 'GIT_USE_READ_COMMAND' in process.env
 
-      const spawnedProcess = execFile(gitLocation, args, execOptions, function(
-        err: Error | null,
-        stdout,
-        stderr
-      ) {
-        if (!err) {
-          resolve({ stdout, stderr, exitCode: 0 })
-          return
-        }
+    const execOptions: ExecFileOptionsWithStringEncoding = {
+      cwd: useReadCommand ? process.cwd() : path,
+      encoding: 'utf8',
+      maxBuffer: options ? options.maxBuffer : 10 * 1024 * 1024,
+      env: useReadCommand ? { } : env,
+    }
 
-        const errWithCode = err as ErrorWithCode
+    let readCommandArgs
 
-        let code = errWithCode.code
+    if (useReadCommand) {
+      readCommandArgs = [ '-C', path, ...args ]
+      args = [ 'read-command' ]
+    }
 
-        // If the error's code is a string then it means the code isn't the
-        // process's exit code but rather an error coming from Node's bowels,
-        // e.g., ENOENT.
-        if (typeof code === 'string') {
-          if (code === 'ENOENT') {
-            let message = err.message
-            if (GitProcess.pathExists(path) === false) {
-              message = 'Unable to find path to repository on disk.'
-              code = RepositoryDoesNotExistErrorCode
-            } else {
-              message = `Git could not be found at the expected path: '${gitLocation}'. This might be a problem with how the application is packaged, so confirm this folder hasn't been removed when packaging.`
-              code = GitNotFoundErrorCode
-            }
+    let child_process
+    let promise
 
-            const error = new Error(message) as ErrorWithCode
-            error.name = err.name
-            error.code = code
-            reject(error)
-          } else {
-            reject(err)
+    if (useReadCommand && HotSpare !== null) {
+      child_process = HotSpare.child_process
+      promise = HotSpare.promise
+      HotSpare = null
+    } else {
+      const p = await startProcess(gitLocation, args, execOptions)
+      child_process = p.child_process
+      promise = p.promise
+    }
+
+    if (useReadCommand) {
+      setImmediate(async function() {
+        if (HotSpare === null && !LaunchingHotSpare) {
+          LaunchingHotSpare = true
+          try {
+            HotSpare = await startProcess(gitLocation, args, execOptions)
+          } finally {
+            LaunchingHotSpare = false
           }
-
-          return
-        }
-
-        if (typeof code === 'number') {
-          resolve({ stdout, stderr, exitCode: code })
-          return
-        }
-
-        // Git has returned an output that couldn't fit in the specified buffer
-        // as we don't know how many bytes it requires, rethrow the error with
-        // details about what it was previously set to...
-        if (err.message === 'stdout maxBuffer exceeded') {
-          reject(
-            new Error(
-              `The output from the command could not fit into the allocated stdout buffer. Set options.maxBuffer to a larger value than ${
-                execOptions.maxBuffer
-              } bytes`
-            )
-          )
-        } else {
-          reject(err)
         }
       })
+    }
 
-      ignoreClosedInputStream(spawnedProcess)
+    if (readCommandArgs !== undefined) {
+      const readCommandEnv = env as any
+      const environmentKeys = Object.keys(readCommandEnv)
 
-      if (options && options.stdin !== undefined) {
-        // See https://github.com/nodejs/node/blob/7b5ffa46fe4d2868c1662694da06eb55ec744bde/test/parallel/test-stdin-pipe-large.js
-        spawnedProcess.stdin.end(options.stdin, options.stdinEncoding)
+      child_process.stdin.write(formatPktLine(environmentKeys.length.toString(10)))
+
+      for (const key of environmentKeys) {
+        child_process.stdin.write(formatPktLine(`${key}=${readCommandEnv[key]}`))
       }
 
-      if (options && options.processCallback) {
-        options.processCallback(spawnedProcess)
+      child_process.stdin.write(formatPktLine(readCommandArgs.length.toString(10)))
+
+      for (const arg of readCommandArgs) {
+        child_process.stdin.write(formatPktLine(arg))
       }
-    })
+    }
+
+    if (options && options.stdin) {
+      // See https://github.com/nodejs/node/blob/7b5ffa46fe4d2868c1662694da06eb55ec744bde/test/parallel/test-stdin-pipe-large.js
+      child_process.stdin.end(options.stdin, options.stdinEncoding)
+    }
+
+    if (options && options.processCallback) {
+      options.processCallback(child_process)
+    }
+
+    return promise
+  }
+
+  /** Try to parse an error type from stderr. */
+  public static parseError(stderr: string): GitError | null {
+    for (const regex in GitErrorRegexes) {
+      if (stderr.match(regex)) {
+        const error: GitError = (GitErrorRegexes as any)[regex]
+        return error
+      }
+    }
+
+    return null
+  }
+
+  public static shutdown() {
+    if (HotSpare) {
+      HotSpare.child_process.kill()
+    }
   }
 }
 
-/**
- * Prevent errors originating from the stdin stream related
- * to the child process closing the pipe from bubbling up and
- * causing an unhandled exception when no error handler is
- * attached to the input stream.
- *
- * The common scenario where this happens is if the consumer
- * is writing data to the stdin stream of a child process and
- * the child process for one reason or another decides to either
- * terminate or simply close its standard input. Imagine this
- * scenario
- *
- *  cat /dev/zero | head -c 1
- *
- * The 'head' command would close its standard input (by terminating)
- * the moment it has read one byte. In the case of Git this could
- * happen if you for example pass badly formed input to apply-patch.
- *
- * Since consumers of dugite using the `exec` api are unable to get
- * a hold of the stream until after we've written data to it they're
- * unable to fix it themselves so we'll just go ahead and ignore the
- * error for them. By supressing the stream error we can pick up on
- * the real error when the process exits when we parse the exit code
- * and the standard error.
- *
- * See https://github.com/desktop/desktop/pull/4027#issuecomment-366213276
- */
-function ignoreClosedInputStream(process: ChildProcess) {
-  process.stdin.on('error', err => {
-    const code = (err as ErrorWithCode).code
-
-    // Is the error one that we'd expect from the input stream being
-    // closed, i.e. EPIPE on macOS and EOF on Windows. We've also
-    // seen ECONNRESET failures on Linux hosts so let's throw that in
-    // there for good measure.
-    if (code === 'EPIPE' || code === 'EOF' || code === 'ECONNRESET') {
-      return
-    }
-
-    // Nope, this is something else. Are there any other error listeners
-    // attached than us? If not we'll have to mimic the behavior of
-    // EventEmitter.
-    //
-    // See https://nodejs.org/api/errors.html#errors_error_propagation_and_interception
-    //
-    // "For all EventEmitter objects, if an 'error' event handler is not
-    //  provided, the error will be thrown"
-    if (process.stdin.listeners('error').length <= 1) {
-      throw err
-    }
-  })
-}
+// Make sure we shut down any running read-command processes when the
+// process is getting ready to exit.
+process.on('exit', GitProcess.shutdown)
